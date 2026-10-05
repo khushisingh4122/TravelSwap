@@ -1,0 +1,1 @@
+CREATE TABLE interests (user_id TEXT PRIMARY KEY NOT NULL REFERENCES profiles(user_id), direction TEXT NOT NULL CHECK(direction IN ('INR-TWD','TWD-INR')), travel_month TEXT NOT NULL, consent_version TEXT NOT NULL, updated_at INTEGER NOT NULL);

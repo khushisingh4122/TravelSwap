@@ -1,0 +1,7 @@
+work/
+.sites-runtime/
+node_modules/
+outputs/
+.env*
+!.env.example
+.wrangler/

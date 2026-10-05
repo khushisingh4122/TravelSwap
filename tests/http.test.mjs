@@ -1,0 +1,43 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {createServer,openDatabase} from '../scripts/preview.mjs';
+test('real HTTP accounts, sessions, end-to-end flow and spoof resistance',async t=>{
+ const DB=openDatabase(':memory:'),server=createServer({DB,port:0});await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>{server.close();DB.sql.close();});const origin='http://127.0.0.1:'+server.address().port;
+ function client(){let cookie='';return {get cookie(){return cookie;},async call(path,data,extra={}){const r=await fetch(origin+'/api/'+path,{method:data===undefined?'GET':'POST',headers:{...(cookie?{cookie}:{}),...(data===undefined?{}:{origin,'Content-Type':'application/json','X-TravelSwap-Request':'1'}),...extra},body:data===undefined?undefined:JSON.stringify(data)});const c=r.headers.get('set-cookie');if(c)cookie=c.split(';')[0];return {status:r.status,headers:r.headers,data:await r.json()};}};}
+ const a=client(),b=client(),eve=client(),anon=client(),password='A unique test password 123!';
+ assert.equal((await anon.call('session',undefined,{'oai-authenticated-user-id':'demo-ananya','oai-authenticated-user-email':'demo@example.test',cookie:'local_user=alice'})).data.user,null);
+ assert.equal((await a.call('auth/signup',{name:'Alice',email:'alice@example.test',password},{origin:'http://evil.test'})).status,403);
+ assert.equal((await a.call('auth/signup',{name:'Alice',email:'alice@example.test',password})).status,200);const firstCookie=a.cookie;assert.match(firstCookie,/travelswap_session=[a-f0-9]{64}/);
+ assert.equal((await a.call('session')).data.user.display_name,'Alice');
+ assert.notEqual(DB.sql.prepare('SELECT password_hash FROM local_accounts').get().password_hash,password);
+ assert.ok(!DB.sql.prepare('SELECT token_hash FROM local_sessions').all().some(s=>firstCookie.includes(s.token_hash)));
+ await a.call('auth/logout',{});assert.equal((await a.call('session')).data.user,null);
+ assert.equal((await anon.call('session',undefined,{cookie:firstCookie})).data.user,null);
+ assert.equal((await a.call('auth/login',{email:'alice@example.test',password:'wrong password 123'})).status,401);
+ const login=await a.call('auth/login',{email:'alice@example.test',password});assert.equal(login.status,200);assert.match(login.headers.get('set-cookie'),/HttpOnly; SameSite=Strict/);assert.notEqual(a.cookie,firstCookie);
+ assert.equal((await b.call('auth/signup',{name:'Bob',email:'bob@example.test',password})).status,200);
+ assert.equal((await eve.call('auth/signup',{name:'Eve',email:'eve@example.test',password})).status,200);
+ const date=new Date();date.setUTCMonth(date.getUTCMonth()+2,1);const travelMonth=date.toISOString().slice(0,7);
+ await a.call('profile',{displayName:'Alice',country:'India',preferredCurrency:'INR',destination:'Taiwan',travelMonth});
+ await b.call('profile',{displayName:'Bob',country:'Taiwan',preferredCurrency:'TWD',destination:'India',travelMonth});
+ const aa=await a.call('listings',{have:'INR',need:'TWD',amount:'10000',origin:'India',destination:'Taiwan',travelMonth});
+ const bb=await b.call('listings',{have:'TWD',need:'INR',amount:'3800',origin:'Taiwan',destination:'India',travelMonth});
+ assert.equal(aa.status,201);assert.equal(bb.status,201);assert.equal((await a.call('listings')).data.listings[0].matchScore,100);
+ const rid=(await a.call('requests',{listingId:bb.data.id,sourceListingId:aa.data.id})).data.id;assert.ok(rid);
+ assert.equal((await eve.call('requests/'+rid+'/accept',{})).status,404);assert.equal((await b.call('requests/'+rid+'/accept',{})).status,200);
+ assert.equal((await a.call('requests/'+rid+'/messages',{message:'Hello Bob from the HTTP test'})).status,201);
+ assert.equal((await b.call('requests/'+rid+'/messages')).data.messages[0].body,'Hello Bob from the HTTP test');
+ assert.equal((await eve.call('requests/'+rid+'/messages')).status,404);
+ assert.equal((await eve.call('listings/'+aa.data.id+'/edit',{have:'INR'})).status,404);
+ await a.call('auth/logout',{});await a.call('auth/login',{email:'alice@example.test',password});
+ assert.equal((await a.call('requests/'+rid+'/messages')).data.messages.length,1);
+ assert.equal((await b.call('requests/'+rid+'/complete',{})).status,200);
+ assert.equal((await a.call('requests')).data.requests[0].status,'completed');
+ assert.equal((await eve.call('profile/delete',{confirm:'DELETE'})).status,200);assert.equal(DB.sql.prepare("SELECT COUNT(*) AS n FROM local_accounts WHERE email='eve@example.test'").get().n,0);assert.equal((await eve.call('session')).data.user,null);
+ const demo=await anon.call('auth/demo',{account:'ananya'});assert.equal(demo.status,200);assert.equal((await anon.call('session')).data.user.is_demo,1);
+ const demoId=DB.sql.prepare("SELECT user_id FROM profiles WHERE user_id='demo-ananya'").get().user_id;
+ assert.equal(demoId,'demo-ananya');assert.equal(DB.sql.prepare('PRAGMA foreign_key_check').all().length,0);
+ DB.sql.prepare('UPDATE local_sessions SET expires_at=0').run();assert.equal((await anon.call('session')).data.user,null);
+});
+
+test('accounts, sessions, listings and messages survive a database reopen',async()=>{const {mkdtempSync,rmSync}=await import('node:fs');const {tmpdir}=await import('node:os');const {join}=await import('node:path');const root=mkdtempSync(join(tmpdir(),'travelswap-test-')),file=join(root,'persist.sqlite');let DB=openDatabase(file);try{DB.sql.prepare("INSERT INTO profiles(user_id,public_id,display_name,created_at) VALUES('a','pa','Alice',1),('b','pb','Bob',1)").run();DB.sql.prepare("INSERT INTO local_accounts VALUES('a','a@example.test','salt','hash')").run();DB.sql.prepare("INSERT INTO local_sessions VALUES('hashed-token','a',9999999999)").run();DB.sql.prepare("INSERT INTO listings(id,owner_id,have,need,amount,wanted,city,start_date,end_date,note,status,created_at) VALUES('l','b','TWD','INR',380000,1000000,'','2026-12-01','2026-12-31','','matched',1)").run();DB.sql.prepare("INSERT INTO requests(id,listing_id,sender_id,status,created_at) VALUES('r','l','a','accepted',1)").run();DB.sql.prepare("INSERT INTO messages VALUES('m','r','a','Persistent message',1)").run();DB.sql.close();DB=openDatabase(file);assert.equal(DB.sql.prepare('SELECT body FROM messages').get().body,'Persistent message');assert.equal(DB.sql.prepare('SELECT email FROM local_accounts').get().email,'a@example.test');assert.equal(DB.sql.prepare('SELECT count(*) AS n FROM local_sessions').get().n,1);assert.equal(DB.sql.prepare('PRAGMA foreign_key_check').all().length,0);}finally{DB.sql.close();const {resolve,dirname,basename}=await import('node:path');if(dirname(resolve(root))!==resolve(tmpdir())||!basename(root).startsWith('travelswap-test-'))throw Error('Unexpected cleanup path');rmSync(root,{recursive:true,force:true});}});
